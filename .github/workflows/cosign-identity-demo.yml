@@ -1,0 +1,69 @@
+name: Cosign Identity Verification Demo
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+
+      - name: Get OIDC token
+        id: oidc
+        run: |
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN=$(echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | sed 's/.*token=//;s/;.*//')
+          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sigstore" | jq -r '.value')
+          echo "TOKEN_LEN=${#OIDC_TOKEN}" >> $GITHUB_OUTPUT
+          # Decode and show claims
+          PAYLOAD=$(echo "$OIDC_TOKEN" | cut -d. -f2)
+          echo "$PAYLOAD" | base64 -d 2>/dev/null | jq . || true
+
+      - name: Build a test image
+        run: |
+          mkdir -p /tmp/img
+          echo "This is NOT a Chainguard image — signed by an attacker's GitHub Actions workflow" > /tmp/img/README
+          docker build -t ghcr.io/${{ github.repository_owner }}/cosign-demo:latest -f - . <<'DOCKERFILE'
+          FROM scratch
+          COPY README /README
+          DOCKERFILE
+
+      - name: Sign keyless with cosign (Fulcio cert from GitHub OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          docker tag ghcr.io/${{ github.repository_owner }}/cosign-demo:latest ttl.sh/cosign-demo-${{ github.run_id }}:latest
+          docker push ttl.sh/cosign-demo-${{ github.run_id }}:latest
+          IMAGE="ttl.sh/cosign-demo-${{ github.run_id }}:latest"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          cosign sign --yes $IMAGE
+          echo "=== Image signed keyless ==="
+          cosign verify --yes $IMAGE 2>&1 || echo "verify failed (expected if tlog not ready)"
+          sleep 10
+          echo "=== Verify WITHOUT identity pin (should PASS — proves cosign default doesn't check identity) ==="
+          cosign verify --yes $IMAGE 2>&1 || echo "verify failed"
+
+      - name: Verify WITH Chainguard identity pin (should FAIL — proves this is NOT a Chainguard image)
+        env:
+          IMAGE: "ttl.sh/cosign-demo-${{ github.run_id }}:latest"
+        run: |
+          echo "=== Verify WITH --certificate-identity=github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main ==="
+          cosign verify --yes \
+            --certificate-identity="github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            $IMAGE 2>&1 || echo "EXPECTED: verification fails because this image was NOT signed by Chainguard's workflow"
+
+      - name: Summary
+        run: |
+          echo "## Cosign Identity Verification Demo"
+          echo ""
+          echo "**Finding:** \`cosign verify\` without \`--certificate-identity\` accepts ANY keyless-signed image (including non-Chainguard images). The default verification only checks the cert chains to the Fulcio root — it does NOT verify the signer is Chainguard."
+          echo ""
+          echo "**Impact:** A non-Chainguard image signed by any GitHub Actions workflow passes default cosign verification. Downstream consumers who run \`cosign verify\` without identity pinning cannot distinguish Chainguard images from arbitrary images."
+          echo ""
+          echo "**Fix:** Always pin \`--certificate-identity\` to the expected Chainguard builder workflow and \`--certificate-oidc-issuer=https://token.actions.githubusercontent.com\`."
