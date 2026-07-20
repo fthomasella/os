@@ -23,39 +23,53 @@ jobs:
           DOCKERFILE
 
       - name: Push to ttl.sh (ephemeral registry)
-        run: |
-          docker push ttl.sh/cosign-demo-${{ github.run_id }}:latest
-          echo "IMAGE=ttl.sh/cosign-demo-${{ github.run_id }}:latest" >> $GITHUB_ENV
+        run: docker push ttl.sh/cosign-demo-${{ github.run_id }}:latest
 
       - name: Sign keyless with cosign
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          cosign sign --yes ${{ env.IMAGE }}
+          cosign sign --yes ttl.sh/cosign-demo-${{ github.run_id }}:latest
           echo "::notice::Image signed keyless by GitHub Actions workflow (not Chainguard)"
 
       - name: Wait for transparency log
         run: sleep 15
 
-      - name: "PROOF 1: cosign verify WITHOUT identity pin (PASSES — proves default verify accepts non-Chainguard)"
+      - name: "PROOF 1: cosign verify WITHOUT identity pin"
         run: |
           echo "=== cosign verify (no identity pin) ==="
-          cosign verify --yes ${{ env.IMAGE }} 2>&1 || echo "FAILED (unexpected)"
-          echo ""
-          echo "::warning::cosign verify PASSED for a non-Chainguard image — default verification does NOT check signer identity"
+          set +e
+          cosign verify ttl.sh/cosign-demo-${{ github.run_id }}:latest 2>&1
+          EXIT_CODE=$?
+          set -e
+          echo "Exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "::warning::cosign verify PASSED for a non-Chainguard image — default verification does NOT check signer identity"
+          else
+            echo "::notice::cosign verify failed (exit $EXIT_CODE) — may need tlog delay"
+          fi
 
-      - name: "PROOF 2: cosign verify WITH Chainguard identity pin (FAILS — proves this is NOT signed by Chainguard)"
+      - name: "PROOF 2: cosign verify WITH Chainguard identity pin"
         run: |
           echo "=== cosign verify --certificate-identity=github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main ==="
-          cosign verify --yes \
+          set +e
+          cosign verify \
             --certificate-identity="github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            ${{ env.IMAGE }} 2>&1 && echo "UNEXPECTED: verify passed" || echo "EXPECTED: verification fails — this image was NOT signed by Chainguard's release workflow"
-          echo ""
-          echo "::notice::cosign verify with Chainguard identity pin FAILED — proves the image is NOT from Chainguard"
+            ttl.sh/cosign-demo-${{ github.run_id }}:latest 2>&1
+          EXIT_CODE=$?
+          set -e
+          echo "Exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::notice::cosign verify with Chainguard identity pin FAILED (exit $EXIT_CODE) — proves the image is NOT from Chainguard"
+          else
+            echo "::error::UNEXPECTED: verify passed with Chainguard identity — should have failed"
+          fi
 
-      - name: Show certificate details (proves signer is our workflow, not Chainguard)
+      - name: Show certificate details
         run: |
-          echo "=== Certificate subject (the signer identity) ==="
-          cosign verify --yes --output-certificate=/tmp/cert.pem ${{ env.IMAGE }} 2>/dev/null || true
+          echo "=== Certificate (the signer identity) ==="
+          set +e
+          cosign verify --output-certificate=/tmp/cert.pem ttl.sh/cosign-demo-${{ github.run_id }}:latest 2>/dev/null
           openssl x509 -in /tmp/cert.pem -text -noout 2>/dev/null | grep -E "Subject:|Issuer:|URI:" | head -10 || echo "cert extraction failed"
+          set -e
